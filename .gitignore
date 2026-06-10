@@ -1,0 +1,38 @@
+# ROS/colcon build outputs
+build/
+install/
+log/
+
+# CMake outputs
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Native build artifacts
+*.a
+*.so
+*.o
+*.obj
+*.dll
+*.dylib
+*.exe
+
+# Editor and local tooling state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python caches from ROS helper scripts
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+*.log
+
+# ImGui local window layout
+imgui.ini

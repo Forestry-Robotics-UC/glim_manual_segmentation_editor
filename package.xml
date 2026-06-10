@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>glim_manual_segmentation_editor</name>
+  <version>0.0.0</version>
+  <description>External GLIM manual point-cloud segmentation editor.</description>
+  <maintainer email="mario-cristovao@isr.uc.pt">mario-cristovao</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>glim</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

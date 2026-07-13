@@ -10,10 +10,10 @@
 int main(int argc, char** argv) {
   using namespace boost::program_options;
   options_description desc("GLIM manual segmentation editor");
-  desc.add_options()                                                       //
-    ("help", "produce help message")                                       //
-    ("map_path", value<std::string>(), "Input map path (dump directory)")  //
-    ("debug", "Enable debug printing")                                     //
+  desc.add_options()                                                            //
+    ("help", "produce help message")                                            //
+    ("map_path", value<std::string>(), "Input GLIM dump directory, PLY, or PCD") //
+    ("debug", "Enable debug printing")                                          //
     ;
 
   positional_options_description po;
@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
   std::string init_map_path;
   if (vm.count("map_path")) {
     init_map_path = vm["map_path"].as<std::string>();
-    spdlog::info("map_path={}", init_map_path);
+    spdlog::info("input_path={}", init_map_path);
   }
 
   glim_manual_segmentation_editor::ManualSegmentationEditor editor(init_map_path);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(glim_manual_segmentation_editor LANGUAGES CXX)
+project(glim_manual_segmentation_editor LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,7 @@ find_package(glim REQUIRED)
 find_package(gtsam_points REQUIRED)
 find_package(Iridescence REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io)
 find_package(spdlog REQUIRED)
 
 add_library(${PROJECT_NAME}_core SHARED
@@ -39,6 +40,7 @@ target_include_directories(${PROJECT_NAME}_core PUBLIC
 )
 target_include_directories(${PROJECT_NAME}_core PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../glim/thirdparty/json/include
+  ${PCL_INCLUDE_DIRS}
 )
 target_link_libraries(${PROJECT_NAME}_core PUBLIC
   Eigen3::Eigen
@@ -47,6 +49,9 @@ target_link_libraries(${PROJECT_NAME}_core PUBLIC
   OpenMP::OpenMP_CXX
   spdlog::spdlog
   $<TARGET_NAME_IF_EXISTS:Iridescence::Iridescence>
+)
+target_link_libraries(${PROJECT_NAME}_core PRIVATE
+  ${PCL_LIBRARIES}
 )
 
 add_executable(manual_segmentation_editor

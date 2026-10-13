@@ -9,6 +9,7 @@
 #include <glim_manual_segmentation_editor/point_label_layer.hpp>
 #include <glim_manual_segmentation_editor/points_selector.hpp>
 #include <guik/progress_modal.hpp>
+#include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <spdlog/spdlog.h>
 
 namespace glim_manual_segmentation_editor {
@@ -29,8 +30,11 @@ private:
   void sync_class_inputs(int class_id);
   std::string default_label_path() const;
   std::string submap_path(const std::string& root, int index) const;
+  void ensure_normals(const gtsam_points::PointCloudCPU::Ptr& frame);
 
-  std::vector<glim::SubMap::Ptr> load_submaps(guik::ProgressInterface& progress, const std::string& map_path);
+  std::vector<glim::SubMap::Ptr> load_map_source(guik::ProgressInterface& progress, const std::string& path);
+  std::vector<glim::SubMap::Ptr> load_glim_submaps(guik::ProgressInterface& progress, const std::string& map_path);
+  glim::SubMap::Ptr load_point_cloud_submap(guik::ProgressInterface& progress, const std::string& path);
   bool save_labels(guik::ProgressInterface& progress, const std::string& path);
   bool export_semantic_ply(guik::ProgressInterface& progress, const std::string& path);
 

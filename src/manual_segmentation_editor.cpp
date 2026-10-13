@@ -1,11 +1,20 @@
 #include <glim_manual_segmentation_editor/manual_segmentation_editor.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 
 #include <glk/io/ply_io.hpp>
 #include <guik/progress_modal.hpp>
@@ -15,11 +24,231 @@
 #include <portable-file-dialogs.h>
 #include <gtsam_points/features/normal_estimation.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/PCLPointField.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/io/ply_io.h>
 
 #include <glim/mapping/sub_map.hpp>
 #include <glim/util/logging.hpp>
 
 namespace glim_manual_segmentation_editor {
+namespace {
+
+std::string to_lower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+std::string lower_extension(const std::string& path) {
+  return to_lower(std::filesystem::path(path).extension().string());
+}
+
+bool is_point_cloud_file(const std::string& path) {
+  const std::string ext = lower_extension(path);
+  return ext == ".ply" || ext == ".pcd";
+}
+
+const pcl::PCLPointField* find_field(const pcl::PCLPointCloud2& cloud, std::initializer_list<const char*> names) {
+  for (const auto& field : cloud.fields) {
+    const std::string field_name = to_lower(field.name);
+    for (const auto* name : names) {
+      if (field_name == name) {
+        return &field;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+std::size_t field_scalar_size(const pcl::PCLPointField& field) {
+  switch (field.datatype) {
+    case pcl::PCLPointField::BOOL:
+    case pcl::PCLPointField::INT8:
+    case pcl::PCLPointField::UINT8:
+      return 1;
+    case pcl::PCLPointField::INT16:
+    case pcl::PCLPointField::UINT16:
+      return 2;
+    case pcl::PCLPointField::INT32:
+    case pcl::PCLPointField::UINT32:
+    case pcl::PCLPointField::FLOAT32:
+      return 4;
+    case pcl::PCLPointField::INT64:
+    case pcl::PCLPointField::UINT64:
+    case pcl::PCLPointField::FLOAT64:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+bool is_readable_scalar_field(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField* field) {
+  if (!field) {
+    return false;
+  }
+
+  const std::size_t scalar_size = field_scalar_size(*field);
+  return scalar_size != 0 && (field->count == 0 || field->count >= 1) && field->offset + scalar_size <= cloud.point_step;
+}
+
+std::size_t point_data_offset(const pcl::PCLPointCloud2& cloud, std::size_t point_index) {
+  if (cloud.width == 0) {
+    return point_index * cloud.point_step;
+  }
+
+  const std::size_t row = point_index / cloud.width;
+  const std::size_t column = point_index % cloud.width;
+  const std::size_t row_step = cloud.row_step ? cloud.row_step : static_cast<std::size_t>(cloud.width) * cloud.point_step;
+  return row * row_step + column * cloud.point_step;
+}
+
+template <typename T>
+T read_value(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField& field, std::size_t point_index) {
+  T value{};
+  const std::size_t offset = point_data_offset(cloud, point_index) + field.offset;
+  if (offset + sizeof(T) > cloud.data.size()) {
+    throw std::out_of_range("point field offset outside cloud data");
+  }
+
+  std::memcpy(&value, cloud.data.data() + offset, sizeof(T));
+  return value;
+}
+
+double read_scalar(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField& field, std::size_t point_index) {
+  switch (field.datatype) {
+    case pcl::PCLPointField::BOOL:
+      return read_value<bool>(cloud, field, point_index) ? 1.0 : 0.0;
+    case pcl::PCLPointField::INT8:
+      return read_value<std::int8_t>(cloud, field, point_index);
+    case pcl::PCLPointField::UINT8:
+      return read_value<std::uint8_t>(cloud, field, point_index);
+    case pcl::PCLPointField::INT16:
+      return read_value<std::int16_t>(cloud, field, point_index);
+    case pcl::PCLPointField::UINT16:
+      return read_value<std::uint16_t>(cloud, field, point_index);
+    case pcl::PCLPointField::INT32:
+      return read_value<std::int32_t>(cloud, field, point_index);
+    case pcl::PCLPointField::UINT32:
+      return read_value<std::uint32_t>(cloud, field, point_index);
+    case pcl::PCLPointField::INT64:
+      return static_cast<double>(read_value<std::int64_t>(cloud, field, point_index));
+    case pcl::PCLPointField::UINT64:
+      return static_cast<double>(read_value<std::uint64_t>(cloud, field, point_index));
+    case pcl::PCLPointField::FLOAT32:
+      return read_value<float>(cloud, field, point_index);
+    case pcl::PCLPointField::FLOAT64:
+      return read_value<double>(cloud, field, point_index);
+    default:
+      throw std::runtime_error("unsupported point field type");
+  }
+}
+
+gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud2& cloud, const std::shared_ptr<spdlog::logger>& logger) {
+  const auto* x_field = find_field(cloud, {"x"});
+  const auto* y_field = find_field(cloud, {"y"});
+  const auto* z_field = find_field(cloud, {"z"});
+  if (!is_readable_scalar_field(cloud, x_field) || !is_readable_scalar_field(cloud, y_field) || !is_readable_scalar_field(cloud, z_field)) {
+    logger->warn("Point cloud file is missing readable scalar x/y/z fields");
+    return nullptr;
+  }
+
+  const auto* intensity_field = find_field(cloud, {"intensity", "intensities", "i", "reflectance", "reflectivity", "scalar_intensity"});
+  const auto* normal_x_field = find_field(cloud, {"normal_x", "nx"});
+  const auto* normal_y_field = find_field(cloud, {"normal_y", "ny"});
+  const auto* normal_z_field = find_field(cloud, {"normal_z", "nz"});
+  const bool has_intensity_field = is_readable_scalar_field(cloud, intensity_field);
+  const bool has_normal_fields =
+    is_readable_scalar_field(cloud, normal_x_field) && is_readable_scalar_field(cloud, normal_y_field) && is_readable_scalar_field(cloud, normal_z_field);
+
+  std::size_t point_count = static_cast<std::size_t>(cloud.width) * cloud.height;
+  if (point_count == 0) {
+    if (cloud.point_step == 0) {
+      logger->warn("Point cloud file has no point count and no point_step");
+      return nullptr;
+    }
+    point_count = cloud.data.size() / cloud.point_step;
+  }
+  if (point_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    logger->warn("Point cloud contains too many points for the editor: {}", point_count);
+    return nullptr;
+  }
+
+  std::vector<Eigen::Vector4d> points;
+  std::vector<Eigen::Vector4d> normals;
+  std::vector<double> intensities;
+  points.reserve(point_count);
+  if (has_normal_fields) {
+    normals.reserve(point_count);
+  }
+  if (has_intensity_field) {
+    intensities.reserve(point_count);
+  }
+
+  bool normals_are_valid = has_normal_fields;
+  std::size_t skipped = 0;
+  try {
+    for (std::size_t i = 0; i < point_count; ++i) {
+      const double x = read_scalar(cloud, *x_field, i);
+      const double y = read_scalar(cloud, *y_field, i);
+      const double z = read_scalar(cloud, *z_field, i);
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+        ++skipped;
+        continue;
+      }
+
+      points.emplace_back(x, y, z, 1.0);
+
+      if (has_intensity_field) {
+        const double intensity = read_scalar(cloud, *intensity_field, i);
+        intensities.push_back(std::isfinite(intensity) ? intensity : 0.0);
+      }
+
+      if (has_normal_fields) {
+        Eigen::Vector3d normal(
+          read_scalar(cloud, *normal_x_field, i),
+          read_scalar(cloud, *normal_y_field, i),
+          read_scalar(cloud, *normal_z_field, i));
+        const bool normal_valid = normal.allFinite() && normal.squaredNorm() > 1.0e-12;
+        normals_are_valid &= normal_valid;
+        if (normal_valid) {
+          normal.normalize();
+          normals.emplace_back(normal.x(), normal.y(), normal.z(), 0.0);
+        } else {
+          normals.emplace_back(Eigen::Vector4d::Zero());
+        }
+      }
+    }
+  } catch (const std::exception& e) {
+    logger->warn("Failed to decode point cloud fields: {}", e.what());
+    return nullptr;
+  }
+
+  if (points.empty()) {
+    logger->warn("Point cloud file contains no finite XYZ points");
+    return nullptr;
+  }
+
+  auto frame = std::make_shared<gtsam_points::PointCloudCPU>();
+  frame->add_points(points);
+  if (has_intensity_field) {
+    frame->add_intensities(intensities);
+  }
+  if (normals_are_valid) {
+    frame->add_normals(normals);
+  } else if (has_normal_fields) {
+    logger->warn("Imported normals contain invalid values; normals will be estimated instead");
+  }
+
+  if (skipped) {
+    logger->warn("Skipped {} non-finite points while importing point cloud", skipped);
+  }
+
+  return frame;
+}
+
+}  // namespace
 
 ManualSegmentationEditor::ManualSegmentationEditor(const std::string& init_map_path)
 : init_map_path(init_map_path),
@@ -49,26 +278,37 @@ void ManualSegmentationEditor::run() {
 
 void ManualSegmentationEditor::main_menu() {
   bool start_open_map = false;
+  bool start_open_cloud = false;
   bool start_close_map = false;
   bool start_load_labels = false;
   bool start_save_labels = false;
   bool start_export_ply = false;
 
+  const auto close_current_source = [this]() {
+    if (submaps.empty()) {
+      return true;
+    }
+
+    if (pfd::message("Warning", label_layer->dirty() ? "Close the current source? Unsaved labels will be lost." : "Close the current source?").result() !=
+        pfd::button::ok) {
+      return false;
+    }
+
+    submaps.clear();
+    label_layer->clear();
+    selector->clear();
+    map_path.clear();
+    return true;
+  };
+
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
-      if (ImGui::MenuItem("Open New Map")) {
-        if (!submaps.empty()) {
-          if (pfd::message("Warning", label_layer->dirty() ? "Close the current map? Unsaved labels will be lost." : "Close the current map?").result() ==
-              pfd::button::ok) {
-            submaps.clear();
-            label_layer->clear();
-            selector->clear();
-            map_path.clear();
-            start_open_map = true;
-          }
-        } else {
-          start_open_map = true;
-        }
+      if (ImGui::MenuItem("Open GLIM Map Directory")) {
+        start_open_map = close_current_source();
+      }
+
+      if (ImGui::MenuItem("Open Point Cloud File")) {
+        start_open_cloud = close_current_source();
       }
 
       if (ImGui::MenuItem("Load Labels")) {
@@ -83,7 +323,7 @@ void ManualSegmentationEditor::main_menu() {
         start_export_ply = true;
       }
 
-      if (ImGui::MenuItem("Close Map")) {
+      if (ImGui::MenuItem("Close Source")) {
         start_close_map = true;
       }
 
@@ -94,28 +334,33 @@ void ManualSegmentationEditor::main_menu() {
 
   if (start_close_map) {
     if (submaps.empty()) {
-      logger->warn("No map to close");
-    } else if (pfd::message("Warning", label_layer->dirty() ? "Close the map? Unsaved labels will be lost." : "Close the map?").result() == pfd::button::ok) {
-      submaps.clear();
-      label_layer->clear();
-      selector->clear();
-      map_path.clear();
+      logger->warn("No source to close");
+    } else if (close_current_source()) {
+      logger->info("Closed current source");
     }
   }
 
-  if (start_open_map || !init_map_path.empty()) {
+  if (start_open_map || start_open_cloud || !init_map_path.empty()) {
     guik::RecentFiles recent_files("manual_segmentation_editor_open");
     if (init_map_path.empty()) {
-      map_path = pfd::select_folder("Select a dump directory", recent_files.most_recent()).result();
+      if (start_open_cloud) {
+        const auto paths = pfd::open_file("Select a point cloud file", recent_files.most_recent(), {"Point clouds", "*.ply *.pcd", "PLY", "*.ply", "PCD", "*.pcd"}).result();
+        map_path = paths.empty() ? "" : paths.front();
+      } else {
+        map_path = pfd::select_folder("Select a GLIM dump directory", recent_files.most_recent()).result();
+      }
     } else {
       map_path = init_map_path;
       init_map_path.clear();
     }
 
     if (!map_path.empty()) {
-      logger->info("Load map from {}", map_path);
+      logger->info("Load source from {}", map_path);
       recent_files.push(map_path);
-      progress_modal->open<std::vector<glim::SubMap::Ptr>>("open", [this](guik::ProgressInterface& progress) { return load_submaps(progress, map_path); });
+      const std::string source_path = map_path;
+      progress_modal->open<std::vector<glim::SubMap::Ptr>>("open", [this, source_path](guik::ProgressInterface& progress) {
+        return load_map_source(progress, source_path);
+      });
     }
   }
 
@@ -282,7 +527,20 @@ void ManualSegmentationEditor::sync_class_inputs(int class_id) {
 }
 
 std::string ManualSegmentationEditor::default_label_path() const {
-  return map_path.empty() ? "semantic_labels.json" : map_path + "/semantic_labels.json";
+  if (map_path.empty()) {
+    return "semantic_labels.json";
+  }
+
+  std::error_code ec;
+  if (std::filesystem::is_directory(map_path, ec)) {
+    return map_path + "/semantic_labels.json";
+  }
+
+  if (is_point_cloud_file(map_path)) {
+    return map_path + ".semantic_labels.json";
+  }
+
+  return map_path + "/semantic_labels.json";
 }
 
 std::string ManualSegmentationEditor::submap_path(const std::string& root, int index) const {
@@ -291,7 +549,41 @@ std::string ManualSegmentationEditor::submap_path(const std::string& root, int i
   return oss.str();
 }
 
-std::vector<glim::SubMap::Ptr> ManualSegmentationEditor::load_submaps(guik::ProgressInterface& progress, const std::string& map_path) {
+void ManualSegmentationEditor::ensure_normals(const gtsam_points::PointCloudCPU::Ptr& frame) {
+  if (!frame || frame->has_normals()) {
+    return;
+  }
+
+  if (frame->has_covs()) {
+    frame->add_normals(gtsam_points::estimate_normals(frame->points, frame->covs, frame->size(), 4));
+    return;
+  }
+
+  if (frame->size() < 3) {
+    logger->warn("Not enough points to estimate normals");
+    return;
+  }
+
+  const int k_neighbors = std::min<int>(20, std::max<int>(2, frame->size() - 1));
+  frame->add_normals(gtsam_points::estimate_normals(frame->points, frame->size(), k_neighbors, 4));
+}
+
+std::vector<glim::SubMap::Ptr> ManualSegmentationEditor::load_map_source(guik::ProgressInterface& progress, const std::string& path) {
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    return load_glim_submaps(progress, path);
+  }
+
+  if (is_point_cloud_file(path)) {
+    auto submap = load_point_cloud_submap(progress, path);
+    return submap ? std::vector<glim::SubMap::Ptr>{submap} : std::vector<glim::SubMap::Ptr>{};
+  }
+
+  logger->warn("Unsupported input source: {}. Select a GLIM dump directory, .ply, or .pcd file.", path);
+  return {};
+}
+
+std::vector<glim::SubMap::Ptr> ManualSegmentationEditor::load_glim_submaps(guik::ProgressInterface& progress, const std::string& map_path) {
   progress.set_title("Load submaps");
   progress.set_text("Now loading");
 
@@ -326,13 +618,54 @@ std::vector<glim::SubMap::Ptr> ManualSegmentationEditor::load_submaps(guik::Prog
       if (!frame) {
         logger->warn("Failed to cast frame to PointCloudCPU");
       } else {
-        frame->add_normals(gtsam_points::estimate_normals(frame->points, frame->covs, frame->size(), 4));
+        ensure_normals(frame);
       }
     }
   }
 
   logger->info("loaded {} submaps", num_submaps);
   return loaded;
+}
+
+glim::SubMap::Ptr ManualSegmentationEditor::load_point_cloud_submap(guik::ProgressInterface& progress, const std::string& path) {
+  progress.set_title("Load point cloud");
+  progress.set_text(path);
+  progress.set_maximum(3);
+  progress.increment();
+
+  pcl::PCLPointCloud2 cloud;
+  const std::string ext = lower_extension(path);
+  int result = -1;
+  if (ext == ".pcd") {
+    result = pcl::io::loadPCDFile(path, cloud);
+  } else if (ext == ".ply") {
+    result = pcl::io::loadPLYFile(path, cloud);
+  }
+
+  if (result < 0) {
+    logger->warn("Failed to load point cloud file {}", path);
+    return nullptr;
+  }
+
+  progress.increment();
+  auto frame = pcl_to_point_cloud_cpu(cloud, logger);
+  if (!frame) {
+    return nullptr;
+  }
+
+  ensure_normals(frame);
+  progress.increment();
+
+  auto submap = std::make_shared<glim::SubMap>();
+  submap->id = 0;
+  submap->session_id = 0;
+  submap->T_world_origin.setIdentity();
+  submap->T_origin_endpoint_L.setIdentity();
+  submap->T_origin_endpoint_R.setIdentity();
+  submap->frame = frame;
+
+  logger->info("loaded point cloud {} with {} points", path, frame->size());
+  return submap;
 }
 
 bool ManualSegmentationEditor::save_labels(guik::ProgressInterface& progress, const std::string& path) {

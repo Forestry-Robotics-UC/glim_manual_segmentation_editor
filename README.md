@@ -7,6 +7,7 @@ This package links against GLIM, reuses the same viewer stack, and stores semant
 ## Features
 
 - Load a GLIM map directory containing `graph.txt` and submap folders.
+- Load a standalone `.ply` or `.pcd` point cloud file as a single segmentable map.
 - Select points with the GLIM editor tools:
   - gizmo box/sphere selection
   - radius selection
@@ -17,7 +18,7 @@ This package links against GLIM, reuses the same viewer stack, and stores semant
 - Assign integer semantic class IDs to selected points.
 - Edit class names and RGBA colors.
 - Switch visualization between segmentation, intensity, Z height, and flat color.
-- Save and reload labels from `<map_path>/semantic_labels.json`.
+- Save and reload labels from the loaded source's default label file.
 - Export a binary PLY with a per-point signed 32-bit `class` property.
 
 ## Gallery
@@ -39,18 +40,22 @@ source install/setup.bash
 
 ```bash
 ros2 run glim_manual_segmentation_editor manual_segmentation_editor /path/to/glim_dump
+ros2 run glim_manual_segmentation_editor manual_segmentation_editor /path/to/cloud.pcd
+ros2 run glim_manual_segmentation_editor manual_segmentation_editor /path/to/cloud.ply
 ```
 
-The map path argument is optional. If omitted, use `File > Open New Map` in the viewer.
+The input path argument is optional. If omitted, use `File > Open GLIM Map Directory` or `File > Open Point Cloud File` in the viewer.
+
+Standalone clouds must contain scalar `x`, `y`, and `z` fields. Common intensity field names are retained, and existing `normal_x`/`normal_y`/`normal_z` or `nx`/`ny`/`nz` fields are used when valid. Otherwise, normals are estimated after loading. Non-finite points are skipped while keeping imported attributes aligned.
 
 ## Basic Workflow
 
-1. Run GLIM on a ROS2 dataset or in real-time.
-2. Load a GLIM map directory.
-4. Select points using the editor selection tools.
+1. Start the editor.
+2. Load a GLIM map directory or a standalone PLY/PCD file.
+3. Select points using the editor selection tools.
 4. In `Semantic Labels`, choose a class ID, name, and color.
 5. Click `Assign Selected`.
-6. Use `File > Save Labels` to write `<map_path>/semantic_labels.json`.
+6. Use `File > Save Labels` to write the default semantic label file.
 7. Use `File > Export Semantic PLY` to export the full map with semantic labels.
 
 Class `0` is reserved for `unlabeled`. Clearing selected labels resets those points to class `0`.
@@ -68,10 +73,16 @@ Labels can still be edited in any visualization mode. Switching back to `Segment
 
 ## Label Storage
 
-Labels are stored in:
+For GLIM map directories, labels are stored in:
 
 ```text
 <map_path>/semantic_labels.json
+```
+
+For standalone point-cloud files, labels are stored beside the cloud:
+
+```text
+<cloud_path>.semantic_labels.json
 ```
 
 The file contains:

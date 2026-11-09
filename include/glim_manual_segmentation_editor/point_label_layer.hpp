@@ -33,6 +33,8 @@ public:
 
   void clear();
   void set_submaps(const std::vector<glim::SubMap::Ptr>& submaps, const std::vector<glk::PointCloudBuffer::Ptr>& drawables);
+  /// Rebind rebuilt point buffers after removing points or loading labels.
+  void set_drawables(const std::vector<glk::PointCloudBuffer::Ptr>& drawables);
 
   bool dirty() const;
   void mark_clean();
@@ -57,8 +59,11 @@ public:
 
   bool assign_selected(const std::vector<std::uint64_t>& point_ids);
   bool clear_selected(const std::vector<std::uint64_t>& point_ids);
+  /// Removes points and their labels. Rebuild selection data and rebind drawables afterwards.
+  std::size_t remove_selected(const std::vector<std::uint64_t>& point_ids);
 
   bool save(const std::string& path) const;
+  /// Restores labels and point removals; rebuild selection data and rebind drawables on success.
   bool load(const std::string& path);
 
 private:
@@ -84,6 +89,9 @@ private:
   std::vector<glim::SubMap::Ptr> submaps;
   std::vector<glk::PointCloudBuffer::Ptr> drawables;
   std::vector<std::vector<std::int32_t>> labels_by_submap;
+  // Retain the source clouds so saved removals can be loaded against original point indices.
+  std::vector<gtsam_points::PointCloud::Ptr> source_frames;
+  std::vector<std::vector<int>> source_indices;
   std::vector<bool> color_buffers_ready;
   std::vector<PointClassInfo> class_infos;
 

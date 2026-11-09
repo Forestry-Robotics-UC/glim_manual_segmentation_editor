@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <glim/mapping/sub_map.hpp>
+#include <glim_manual_segmentation_editor/csf_ground_selector.hpp>
 #include <glim_manual_segmentation_editor/ground_grid_selector.hpp>
 #include <glim_manual_segmentation_editor/map_cell.hpp>
 #include <glk/pointcloud_buffer.hpp>
@@ -83,7 +84,9 @@ private:
   gtsam_points::MinCutParams min_cut_params;
   gtsam_points::RegionGrowingParams region_growing_params;
 
+  int ground_selection_method;
   GroundGridSelectorConfig ground_grid_config;
+  CsfGroundSelectorConfig csf_ground_config;
 
   std::shared_ptr<spdlog::logger> logger;
 };

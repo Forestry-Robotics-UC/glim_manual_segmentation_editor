@@ -26,6 +26,7 @@ private:
   void main_menu();
   void ui_callback();
   void draw_label_ui();
+  void refresh_map_view();
 
   void sync_class_inputs(int class_id);
   std::string default_label_path() const;

@@ -261,7 +261,7 @@ void ManualSegmentationEditor::main_menu() {
       return true;
     }
 
-    if (pfd::message("Warning", label_layer->dirty() ? "Close the current source? Unsaved labels will be lost." : "Close the current source?").result() !=
+    if (pfd::message("Warning", label_layer->dirty() ? "Close the current source? Unsaved labels and point removals will be lost." : "Close the current source?").result() !=
         pfd::button::ok) {
       return false;
     }
@@ -351,6 +351,7 @@ void ManualSegmentationEditor::main_menu() {
     if (submaps.empty()) {
       logger->warn("No map loaded");
     } else if (label_layer->load(default_label_path())) {
+      refresh_map_view();
       sync_class_inputs(label_layer->active_class_id());
     }
   }
@@ -398,6 +399,11 @@ void ManualSegmentationEditor::ui_callback() {
   draw_label_ui();
 }
 
+void ManualSegmentationEditor::refresh_map_view() {
+  selector->set_submaps(submaps);
+  label_layer->set_drawables(selector->submap_drawables_ref());
+}
+
 void ManualSegmentationEditor::draw_label_ui() {
   ImGui::SetNextWindowPos(ImVec2(430.0f, 30.0f), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Semantic Labels", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -411,7 +417,7 @@ void ManualSegmentationEditor::draw_label_ui() {
   ImGui::Text("Labeled points: %ld", label_layer->labeled_count());
   ImGui::Text("Label file: %s", default_label_path().c_str());
   if (label_layer->dirty()) {
-    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "Unsaved label changes");
+    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "Unsaved label or point changes");
   }
 
   ImGui::Separator();
@@ -432,6 +438,15 @@ void ManualSegmentationEditor::draw_label_ui() {
     } else if (!label_layer->has_complete_intensities()) {
       ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "Some submaps have no intensities");
     }
+  }
+
+  auto& viewer_settings = guik::viewer()->shader_setting();
+  float point_size = viewer_settings.get<float>("point_size").value_or(0.05f);
+  if (ImGui::DragFloat("Point size (m)", &point_size, 0.001f, 0.001f, 100.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp)) {
+    viewer_settings.set_point_size(point_size);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Drag to resize points in all visualization modes. Ctrl+click to enter a size in meters.");
   }
 
   ImGui::Separator();
@@ -472,6 +487,18 @@ void ManualSegmentationEditor::draw_label_ui() {
 
   if (ImGui::Button("Clear Selection")) {
     selector->clear_selected_points();
+  }
+
+  ImGui::SameLine();
+  ImGui::BeginDisabled(selected.empty() || progress_modal->is_running());
+  if (ImGui::Button("Remove Selected Points")) {
+    if (label_layer->remove_selected(selected) > 0) {
+      refresh_map_view();
+    }
+  }
+  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+    ImGui::SetTooltip("Remove selected points from the map. Save Labels preserves removals; exported PLY files contain only remaining points.");
   }
 
   ImGui::Separator();
@@ -657,11 +684,16 @@ bool ManualSegmentationEditor::export_semantic_ply(guik::ProgressInterface& prog
   std::size_t total_points = 0;
   bool has_intensities = true;
   for (const auto& submap : submaps) {
-    if (!submap || !submap->frame) {
+    if (!submap || !submap->frame || submap->frame->size() == 0) {
       continue;
     }
     total_points += submap->frame->size();
     has_intensities &= submap->frame->has_intensities();
+  }
+
+  if (total_points == 0) {
+    logger->warn("No points left to export");
+    return false;
   }
 
   glk::PLYData ply;

@@ -29,6 +29,7 @@ find_package(spdlog REQUIRED)
 
 add_library(${PROJECT_NAME}_core SHARED
   src/map_cell.cpp
+  src/csf_ground_selector.cpp
   src/ground_grid_selector.cpp
   src/points_selector.cpp
   src/point_label_layer.cpp
@@ -61,6 +62,17 @@ target_link_libraries(manual_segmentation_editor
   ${PROJECT_NAME}_core
   Boost::program_options
 )
+
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(point_removal_test tests/point_removal_test.cpp)
+  target_include_directories(point_removal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../glim/thirdparty/json/include)
+  target_link_libraries(point_removal_test ${PROJECT_NAME}_core)
+  add_test(NAME point_removal COMMAND point_removal_test)
+  set_tests_properties(point_removal PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:${PROJECT_NAME}_core>:$ENV{LD_LIBRARY_PATH}"
+  )
+endif()
 
 install(TARGETS ${PROJECT_NAME}_core manual_segmentation_editor
   EXPORT ${PROJECT_NAME}-targets

@@ -50,6 +50,7 @@ PointsSelector::PointsSelector(std::shared_ptr<spdlog::logger> logger) : picked_
   min_cut_params.foreground_weight = 10.0;
   min_cut_params.foreground_mask_radius = 0.5f;
   min_cut_params.background_mask_radius = 5.0f;
+  ground_selection_method = 0;
 
   auto viewer = guik::viewer();
   viewer->register_drawable_filter("manual_segmentation_filter", [this](const std::string& name) {
@@ -77,9 +78,15 @@ void PointsSelector::clear() {
 }
 
 void PointsSelector::set_submaps(const std::vector<glim::SubMap::Ptr>& submaps) {
+  clear_selected_points();
+  guik::viewer()->remove_drawable("selected_cells");
   this->submaps = submaps;
   submap_drawables.resize(submaps.size());
   std::transform(submaps.begin(), submaps.end(), submap_drawables.begin(), [](const glim::SubMap::Ptr& submap) {
+    if (submap->frame->size() == 0) {
+      guik::viewer()->remove_drawable("submap_" + std::to_string(submap->id));
+      return glk::PointCloudBuffer::Ptr{};
+    }
     return guik::viewer()->update_points("submap_" + std::to_string(submap->id), submap->frame->points, submap->frame->size(), guik::Rainbow(submap->T_world_origin));
   });
 
@@ -136,8 +143,12 @@ gtsam_points::PointCloudCPU::Ptr PointsSelector::collect_submap_points(const std
     return std::make_shared<gtsam_points::PointCloudCPU>();
   }
 
-  const bool has_normals = submaps[0]->frame->has_normals();
-  const bool has_covs = submaps[0]->frame->has_covs();
+  const bool has_normals = std::all_of(point_ids.begin(), point_ids.end(), [this](std::uint64_t id) {
+    return submaps[id >> 32]->frame->has_normals();
+  });
+  const bool has_covs = std::all_of(point_ids.begin(), point_ids.end(), [this](std::uint64_t id) {
+    return submaps[id >> 32]->frame->has_covs();
+  });
 
   auto points = std::make_shared<gtsam_points::PointCloudCPU>();
   points->points_storage.resize(point_ids.size());
@@ -250,9 +261,8 @@ void PointsSelector::draw_ui() {
     ImGui::Separator();
 
     auto& settings = viewer->shader_setting();
-    auto point_size_ = settings.get<float>("point_size");
-    float point_size = point_size_ ? *point_size_ : 10.0f;
-    if (ImGui::DragFloat("Point size", &point_size, 0.01f, 0.01f, 100.0f)) {
+    float point_size = settings.get<float>("point_size").value_or(0.05f);
+    if (ImGui::DragFloat("Point size (m)", &point_size, 0.001f, 0.001f, 100.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp)) {
       settings.set_point_size(point_size);
     }
 
@@ -322,31 +332,57 @@ void PointsSelector::draw_ui() {
     }
 
     ImGui::Separator();
-    if (ImGui::BeginMenu("GroundGrid config")) {
-      ImGui::DragFloat("Grid resolution", &ground_grid_config.resolution, 0.01f, 0.05f, 5.0f, "%.2f m");
-      show_note("GroundGrid raster cell size");
-      ImGui::DragInt("Cell variance point threshold", &ground_grid_config.point_count_cell_variance_threshold, 1, 1, 1000);
-      show_note("Use only the center cell variance after this point count");
-      ImGui::DragFloat("Distance factor", &ground_grid_config.distance_factor, 0.00001f, 0.0f, 0.01f, "%.6f");
-      show_note("Ground patch variance threshold distance factor");
-      ImGui::DragFloat("Minimum distance factor", &ground_grid_config.min_distance_factor, 0.00001f, 0.0f, 0.01f, "%.6f");
-      show_note("Minimum GroundGrid distance factor");
-      ImGui::DragFloat("Ground height threshold", &ground_grid_config.min_point_height_threshold, 0.01f, 0.01f, 2.0f, "%.2f m");
-      show_note("Points below ground height plus this threshold are selected as ground");
-      ImGui::DragFloat("Obstacle height threshold", &ground_grid_config.min_point_height_obstacle_threshold, 0.01f, 0.01f, 2.0f, "%.2f m");
-      show_note("Minimum ground tolerance close to rough/obstacle cells");
-      ImGui::DragFloat("Minimum patch point ratio", &ground_grid_config.min_ground_patch_detection_point_count_threshold, 0.01f, 0.01f, 2.0f, "%.2f");
-      show_note("GroundGrid patch point-count threshold as a ratio of expected points");
-      ImGui::DragFloat("Patch size change distance", &ground_grid_config.patch_size_change_distance, 0.5f, 1.0f, 200.0f, "%.1f m");
-      show_note("Use 5x5 patches after this distance from the grid center");
-      ImGui::DragFloat("Horizontal angular distance", &ground_grid_config.horizontal_point_angular_distance, 0.0001f, 0.0001f, 0.1f, "%.6f rad");
-      show_note("LiDAR horizontal angular resolution used for expected point count");
-      ImGui::DragInt("Max grid cells", &ground_grid_config.max_grid_cells, 10000, 10000, 50000000);
-      show_note("The selector coarsens the grid if the map would exceed this many cells");
+    ImGui::SetNextItemWidth(140);
+    ImGui::Combo("Ground method", &ground_selection_method, "GroundGrid\0CSF\0");
+    ground_selection_method = std::max(0, std::min(ground_selection_method, 1));
+
+    if (ground_selection_method == 0) {
+      if (ImGui::BeginMenu("GroundGrid config")) {
+        ImGui::DragFloat("Grid resolution", &ground_grid_config.resolution, 0.01f, 0.05f, 5.0f, "%.2f m");
+        show_note("GroundGrid raster cell size");
+        ImGui::DragInt("Cell variance point threshold", &ground_grid_config.point_count_cell_variance_threshold, 1, 1, 1000);
+        show_note("Use only the center cell variance after this point count");
+        ImGui::DragFloat("Distance factor", &ground_grid_config.distance_factor, 0.00001f, 0.0f, 0.01f, "%.6f");
+        show_note("Ground patch variance threshold distance factor");
+        ImGui::DragFloat("Minimum distance factor", &ground_grid_config.min_distance_factor, 0.00001f, 0.0f, 0.01f, "%.6f");
+        show_note("Minimum GroundGrid distance factor");
+        ImGui::DragFloat("Ground height threshold", &ground_grid_config.min_point_height_threshold, 0.01f, 0.01f, 2.0f, "%.2f m");
+        show_note("Points below ground height plus this threshold are selected as ground");
+        ImGui::DragFloat("Obstacle height threshold", &ground_grid_config.min_point_height_obstacle_threshold, 0.01f, 0.01f, 2.0f, "%.2f m");
+        show_note("Minimum ground tolerance close to rough/obstacle cells");
+        ImGui::DragFloat("Minimum patch point ratio", &ground_grid_config.min_ground_patch_detection_point_count_threshold, 0.01f, 0.01f, 2.0f, "%.2f");
+        show_note("GroundGrid patch point-count threshold as a ratio of expected points");
+        ImGui::DragFloat("Patch size change distance", &ground_grid_config.patch_size_change_distance, 0.5f, 1.0f, 200.0f, "%.1f m");
+        show_note("Use 5x5 patches after this distance from the grid center");
+        ImGui::DragFloat("Horizontal angular distance", &ground_grid_config.horizontal_point_angular_distance, 0.0001f, 0.0001f, 0.1f, "%.6f rad");
+        show_note("LiDAR horizontal angular resolution used for expected point count");
+        ImGui::DragInt("Max grid cells", &ground_grid_config.max_grid_cells, 10000, 10000, 50000000);
+        show_note("The selector coarsens the grid if the map would exceed this many cells");
+        ImGui::EndMenu();
+      }
+    } else if (ImGui::BeginMenu("CSF config")) {
+      ImGui::DragFloat("Cloth resolution", &csf_ground_config.cloth_resolution, 0.01f, 0.05f, 5.0f, "%.2f m");
+      show_note("Spacing between cloth particles");
+      ImGui::DragFloat("Classification threshold", &csf_ground_config.classification_threshold, 0.01f, 0.01f, 2.0f, "%.2f m");
+      show_note("Maximum vertical distance from the cloth surface for ground points");
+      ImGui::DragInt("Max iterations", &csf_ground_config.max_iterations, 1, 1, 2000);
+      show_note("Maximum cloth simulation iterations");
+      ImGui::DragFloat("Time step", &csf_ground_config.time_step, 0.001f, 0.001f, 1.0f, "%.3f m");
+      show_note("Cloth fall distance per iteration");
+      ImGui::DragFloat("Height offset", &csf_ground_config.height_offset, 0.01f, 0.0f, 10.0f, "%.2f m");
+      show_note("Initial cloth height above the inverted cloud");
+      ImGui::DragFloat("Smoothness", &csf_ground_config.smoothness, 0.01f, 0.0f, 1.0f, "%.2f");
+      show_note("Cloth neighbor smoothing strength");
+      ImGui::DragInt("Smoothing iterations", &csf_ground_config.smoothing_iterations, 1, 0, 20);
+      show_note("Constraint smoothing passes per simulation step");
+      ImGui::DragFloat("Stop threshold", &csf_ground_config.stop_threshold, 0.001f, 0.0f, 0.1f, "%.3f m");
+      show_note("Stop when maximum cloth movement is below this value");
+      ImGui::DragInt("Max cloth cells", &csf_ground_config.max_grid_cells, 10000, 10000, 5000000);
+      show_note("The selector coarsens the cloth grid if the map would exceed this many cells");
       ImGui::EndMenu();
     }
 
-    if (ImGui::Button("Select Ground Points") || show_note("Automatically select ground points with GroundGrid")) {
+    if (ImGui::Button("Select Ground Points") || show_note("Automatically select ground points with the selected method")) {
       select_ground_points();
     }
 
@@ -729,17 +765,47 @@ void PointsSelector::select_ground_points() {
     return;
   }
 
-  const auto result = GroundGridSelector::select_ground_points(submaps, ground_grid_config, logger);
-  selected_point_ids = result.point_ids;
+  if (ground_selection_method == 0) {
+    const auto result = GroundGridSelector::select_ground_points(submaps, ground_grid_config, logger);
+    selected_point_ids = result.point_ids;
 
-  if (selected_point_ids.empty()) {
-    logger->warn(
-      "Select ground points: no points selected ({} input points, {} ground patches, {}x{} grid at {:.3f}m)",
+    if (selected_point_ids.empty()) {
+      logger->warn(
+        "Select GroundGrid ground points: no points selected ({} input points, {} ground patches, {}x{} grid at {:.3f}m)",
+        result.input_point_count,
+        result.ground_patch_count,
+        result.cell_count,
+        result.cell_count,
+        result.resolution);
+      guik::viewer()->remove_drawable("selected");
+      return;
+    }
+
+    auto selected_points = collect_submap_points(selected_point_ids);
+    guik::viewer()->update_points("selected", selected_points->points, selected_points->size(), guik::FlatOrange().set_alpha(0.8).set_point_scale(2.0f));
+    logger->info(
+      "Select GroundGrid ground points: {} points selected from {} input points ({} ground patches, {}x{} grid at {:.3f}m)",
+      selected_points->size(),
       result.input_point_count,
       result.ground_patch_count,
       result.cell_count,
       result.cell_count,
       result.resolution);
+    return;
+  }
+
+  const auto result = CsfGroundSelector::select_ground_points(submaps, csf_ground_config, logger);
+  selected_point_ids = result.point_ids;
+
+  if (selected_point_ids.empty()) {
+    logger->warn(
+      "Select CSF ground points: no points selected ({} input points, {} valid cells, {}x{} cloth at {:.3f}m, {} iterations)",
+      result.input_point_count,
+      result.valid_cell_count,
+      result.rows,
+      result.cols,
+      result.resolution,
+      result.iterations);
     guik::viewer()->remove_drawable("selected");
     return;
   }
@@ -747,13 +813,14 @@ void PointsSelector::select_ground_points() {
   auto selected_points = collect_submap_points(selected_point_ids);
   guik::viewer()->update_points("selected", selected_points->points, selected_points->size(), guik::FlatOrange().set_alpha(0.8).set_point_scale(2.0f));
   logger->info(
-    "Select ground points: {} points selected from {} input points ({} ground patches, {}x{} grid at {:.3f}m)",
+    "Select CSF ground points: {} points selected from {} input points ({} valid cells, {}x{} cloth at {:.3f}m, {} iterations)",
     selected_points->size(),
     result.input_point_count,
-    result.ground_patch_count,
-    result.cell_count,
-    result.cell_count,
-    result.resolution);
+    result.valid_cell_count,
+    result.rows,
+    result.cols,
+    result.resolution,
+    result.iterations);
 }
 
 }  // namespace glim_manual_segmentation_editor

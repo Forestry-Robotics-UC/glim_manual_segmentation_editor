@@ -8,6 +8,7 @@
 
 #include <glk/colormap.hpp>
 #include <guik/viewer/light_viewer.hpp>
+#include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <nlohmann/json.hpp>
 
 namespace glim_manual_segmentation_editor {
@@ -34,6 +35,8 @@ void PointLabelLayer::clear() {
   submaps.clear();
   drawables.clear();
   labels_by_submap.clear();
+  source_frames.clear();
+  source_indices.clear();
   color_buffers_ready.clear();
   class_infos.clear();
   class_infos.push_back({0, default_name(0), default_color(0)});
@@ -51,6 +54,8 @@ void PointLabelLayer::set_submaps(const std::vector<glim::SubMap::Ptr>& submaps,
   this->submaps = submaps;
   this->drawables = submap_drawables;
   labels_by_submap.assign(submaps.size(), {});
+  source_frames.assign(submaps.size(), nullptr);
+  source_indices.assign(submaps.size(), {});
   color_buffers_ready.assign(submaps.size(), false);
   z_range_valid = false;
   cached_z_range = Eigen::Vector2f(0.0f, 1.0f);
@@ -65,6 +70,9 @@ void PointLabelLayer::set_submaps(const std::vector<glim::SubMap::Ptr>& submaps,
     }
 
     labels_by_submap[submap->id].assign(submap->frame->size(), 0);
+    source_frames[submap->id] = submap->frame;
+    source_indices[submap->id].resize(submap->frame->size());
+    std::iota(source_indices[submap->id].begin(), source_indices[submap->id].end(), 0);
     const bool has_intensity = submap->frame && submap->frame->has_intensities();
     any_intensities |= has_intensity;
     complete_intensities &= has_intensity;
@@ -72,6 +80,23 @@ void PointLabelLayer::set_submaps(const std::vector<glim::SubMap::Ptr>& submaps,
 
   has_loaded_map = !submaps.empty();
   is_dirty = false;
+  apply_display_mode();
+}
+
+void PointLabelLayer::set_drawables(const std::vector<glk::PointCloudBuffer::Ptr>& submap_drawables) {
+  drawables = submap_drawables;
+  color_buffers_ready.assign(submaps.size(), false);
+  z_range_valid = false;
+  any_intensities = false;
+  complete_intensities = true;
+  for (const auto& submap : submaps) {
+    if (submap->frame->size() == 0) {
+      continue;
+    }
+    any_intensities |= submap->frame->has_intensities();
+    complete_intensities &= submap->frame->has_intensities();
+  }
+  complete_intensities &= any_intensities;
   apply_display_mode();
 }
 
@@ -267,6 +292,70 @@ bool PointLabelLayer::clear_selected(const std::vector<std::uint64_t>& point_ids
   return true;
 }
 
+std::size_t PointLabelLayer::remove_selected(const std::vector<std::uint64_t>& point_ids) {
+  if (!has_loaded_map || point_ids.empty()) {
+    return 0;
+  }
+
+  std::vector<std::vector<int>> removed(submaps.size());
+  for (const auto packed_id : point_ids) {
+    const std::uint64_t submap_id = packed_id >> 32;
+    const std::uint64_t point_id = packed_id & 0xffffffffull;
+    if (submap_id >= labels_by_submap.size() || point_id >= labels_by_submap[submap_id].size()) {
+      logger->warn("Invalid selected point id {}", packed_id);
+      continue;
+    }
+    removed[submap_id].push_back(static_cast<int>(point_id));
+  }
+
+  auto new_labels = labels_by_submap;
+  auto new_indices = source_indices;
+  std::vector<gtsam_points::PointCloudCPU::Ptr> new_frames(submaps.size());
+  std::size_t removed_count = 0;
+  for (std::size_t id = 0; id < removed.size(); ++id) {
+    auto& indices = removed[id];
+    if (indices.empty()) {
+      continue;
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    removed_count += indices.size();
+
+    std::vector<int> kept;
+    kept.reserve(labels_by_submap[id].size() - indices.size());
+    new_labels[id].clear();
+    new_indices[id].clear();
+    auto removed_it = indices.begin();
+    for (int i = 0; i < static_cast<int>(labels_by_submap[id].size()); ++i) {
+      if (removed_it != indices.end() && i == *removed_it) {
+        ++removed_it;
+        continue;
+      }
+      kept.push_back(i);
+      new_labels[id].push_back(labels_by_submap[id][i]);
+      new_indices[id].push_back(source_indices[id][i]);
+    }
+    new_frames[id] = gtsam_points::sample(submaps[id]->frame, kept);
+  }
+
+  if (removed_count == 0) {
+    return 0;
+  }
+  for (std::size_t id = 0; id < new_frames.size(); ++id) {
+    if (new_frames[id]) {
+      submaps[id]->frame = new_frames[id];
+      submaps[id]->voxelmaps.clear();
+    }
+  }
+  labels_by_submap = std::move(new_labels);
+  source_indices = std::move(new_indices);
+  drawables.clear();
+  z_range_valid = false;
+  is_dirty = true;
+  logger->info("Removed {} selected points from the map", removed_count);
+  return removed_count;
+}
+
 bool PointLabelLayer::save(const std::string& path) const {
   if (!has_loaded_map) {
     logger->warn("No map loaded");
@@ -274,7 +363,11 @@ bool PointLabelLayer::save(const std::string& path) const {
   }
 
   nlohmann::json root;
-  root["version"] = 1;
+  bool has_removals = false;
+  for (std::size_t id = 0; id < source_frames.size(); ++id) {
+    has_removals |= source_frames[id] && source_indices[id].size() != source_frames[id]->size();
+  }
+  root["version"] = has_removals ? 2 : 1;
   root["classes"] = nlohmann::json::array();
 
   auto classes = class_infos;
@@ -314,9 +407,22 @@ bool PointLabelLayer::save(const std::string& path) const {
 
     root["submaps"].push_back({
       {"id", submap->id},
-      {"size", labels.size()},
+      {"size", source_frames[submap->id]->size()},
       {"labels_rle", encoded},
     });
+    if (has_removals) {
+      auto removed = nlohmann::json::array();
+      const auto& kept = source_indices[submap->id];
+      auto kept_it = kept.begin();
+      for (std::size_t i = 0; i < source_frames[submap->id]->size(); ++i) {
+        if (kept_it != kept.end() && static_cast<std::size_t>(*kept_it) == i) {
+          ++kept_it;
+        } else {
+          removed.push_back(i);
+        }
+      }
+      root["submaps"].back()["removed_indices"] = std::move(removed);
+    }
   }
 
   std::ofstream ofs(path);
@@ -342,108 +448,150 @@ bool PointLabelLayer::load(const std::string& path) {
     return false;
   }
 
-  nlohmann::json root;
   try {
+    nlohmann::json root;
     ifs >> root;
+
+    const int version = root.value("version", 0);
+    if (version != 1 && version != 2) {
+      logger->warn("Unsupported semantic label version in {}", path);
+      return false;
+    }
+    if (!root.contains("submaps") || !root["submaps"].is_array() || root["submaps"].size() != submaps.size()) {
+      logger->warn("Label file submap count does not match loaded map");
+      return false;
+    }
+
+    std::vector<PointClassInfo> loaded_classes;
+    loaded_classes.push_back({0, default_name(0), default_color(0)});
+    if (root.contains("classes") && root["classes"].is_array()) {
+      for (const auto& cls_json : root["classes"]) {
+        const int id = cls_json.value("id", 0);
+        if (id <= 0) {
+          continue;
+        }
+
+        Eigen::Vector4f color = default_color(id);
+        if (cls_json.contains("color") && cls_json["color"].is_array() && cls_json["color"].size() == 4) {
+          color = Eigen::Vector4f(
+            cls_json["color"][0].get<float>(),
+            cls_json["color"][1].get<float>(),
+            cls_json["color"][2].get<float>(),
+            cls_json["color"][3].get<float>());
+        }
+
+        loaded_classes.push_back({id, cls_json.value("name", default_name(id)), color});
+      }
+    }
+
+    std::vector<std::vector<std::int32_t>> loaded_labels(submaps.size());
+    std::vector<std::vector<int>> loaded_indices(submaps.size());
+
+    std::vector<bool> seen(labels_by_submap.size(), false);
+    for (const auto& submap_json : root["submaps"]) {
+      const int id = submap_json.value("id", -1);
+      if (id < 0 || id >= static_cast<int>(labels_by_submap.size()) || !submaps[id] || submaps[id]->id != id || seen[id]) {
+        logger->warn("Label file contains invalid submap id {}", id);
+        return false;
+      }
+
+      const std::size_t source_size = source_frames[id]->size();
+      if (submap_json.value("size", std::size_t{0}) != source_size) {
+        logger->warn("Label size mismatch for submap {}", id);
+        return false;
+      }
+
+      std::vector<int> removed;
+      if (version == 2) {
+        if (!submap_json.contains("removed_indices") || !submap_json["removed_indices"].is_array()) {
+          logger->warn("Missing removed point indices for submap {}", id);
+          return false;
+        }
+        for (const auto& index_json : submap_json["removed_indices"]) {
+          if (!index_json.is_number_integer()) {
+            logger->warn("Invalid removed point index for submap {}", id);
+            return false;
+          }
+          const auto index = index_json.get<std::int64_t>();
+          if (index < 0 || static_cast<std::uint64_t>(index) >= source_size || (!removed.empty() && index <= removed.back())) {
+            logger->warn("Invalid or unordered removed point index for submap {}", id);
+            return false;
+          }
+          removed.push_back(static_cast<int>(index));
+        }
+      }
+      const std::size_t expected_size = source_size - removed.size();
+      loaded_indices[id].reserve(expected_size);
+      auto removed_it = removed.begin();
+      for (std::size_t i = 0; i < source_size; ++i) {
+        if (removed_it != removed.end() && static_cast<std::size_t>(*removed_it) == i) {
+          ++removed_it;
+        } else {
+          loaded_indices[id].push_back(static_cast<int>(i));
+        }
+      }
+
+      if (!submap_json.contains("labels_rle") || !submap_json["labels_rle"].is_array()) {
+        logger->warn("Missing RLE labels for submap {}", id);
+        return false;
+      }
+
+      std::vector<std::int32_t> decoded;
+      decoded.reserve(expected_size);
+      for (const auto& run : submap_json["labels_rle"]) {
+        if (!run.is_array() || run.size() != 2) {
+          logger->warn("Invalid RLE entry for submap {}", id);
+          return false;
+        }
+
+        const std::int32_t label = run[0].get<std::int32_t>();
+        const std::size_t count = run[1].get<std::size_t>();
+        if (count > expected_size - decoded.size()) {
+          logger->warn("RLE overrun for submap {}", id);
+          return false;
+        }
+        decoded.insert(decoded.end(), count, label);
+      }
+
+      if (decoded.size() != expected_size) {
+        logger->warn("RLE size mismatch for submap {}", id);
+        return false;
+      }
+
+      loaded_labels[id] = std::move(decoded);
+      seen[id] = true;
+    }
+
+    for (const auto& submap : submaps) {
+      if (!submap || submap->id < 0 || submap->id >= static_cast<int>(seen.size()) || !seen[submap->id]) {
+        logger->warn("Label file is missing labels for a loaded submap");
+        return false;
+      }
+    }
+
+    // Prepare all clouds before committing so invalid files cannot partially change the map.
+    std::vector<gtsam_points::PointCloud::Ptr> loaded_frames(submaps.size());
+    for (std::size_t id = 0; id < submaps.size(); ++id) {
+      loaded_frames[id] = loaded_indices[id].size() == source_frames[id]->size()
+                            ? source_frames[id]
+                            : gtsam_points::sample(source_frames[id], loaded_indices[id]);
+    }
+    for (std::size_t id = 0; id < submaps.size(); ++id) {
+      submaps[id]->frame = loaded_frames[id];
+      submaps[id]->voxelmaps.clear();
+    }
+    class_infos = std::move(loaded_classes);
+    labels_by_submap = std::move(loaded_labels);
+    source_indices = std::move(loaded_indices);
+    drawables.clear();
+    z_range_valid = false;
+    is_dirty = false;
+    logger->info("Loaded semantic labels from {}", path);
+    return true;
   } catch (const std::exception& e) {
-    logger->warn("Failed to parse {}: {}", path, e.what());
+    logger->warn("Failed to load {}: {}", path, e.what());
     return false;
   }
-
-  if (root.value("version", 0) != 1) {
-    logger->warn("Unsupported semantic label version in {}", path);
-    return false;
-  }
-  if (!root.contains("submaps") || !root["submaps"].is_array() || root["submaps"].size() != submaps.size()) {
-    logger->warn("Label file submap count does not match loaded map");
-    return false;
-  }
-
-  std::vector<PointClassInfo> loaded_classes;
-  loaded_classes.push_back({0, default_name(0), default_color(0)});
-  if (root.contains("classes") && root["classes"].is_array()) {
-    for (const auto& cls_json : root["classes"]) {
-      const int id = cls_json.value("id", 0);
-      if (id <= 0) {
-        continue;
-      }
-
-      Eigen::Vector4f color = default_color(id);
-      if (cls_json.contains("color") && cls_json["color"].is_array() && cls_json["color"].size() == 4) {
-        color = Eigen::Vector4f(
-          cls_json["color"][0].get<float>(),
-          cls_json["color"][1].get<float>(),
-          cls_json["color"][2].get<float>(),
-          cls_json["color"][3].get<float>());
-      }
-
-      loaded_classes.push_back({id, cls_json.value("name", default_name(id)), color});
-    }
-  }
-
-  std::vector<std::vector<std::int32_t>> loaded_labels = labels_by_submap;
-  for (auto& labels : loaded_labels) {
-    std::fill(labels.begin(), labels.end(), 0);
-  }
-
-  std::vector<bool> seen(labels_by_submap.size(), false);
-  for (const auto& submap_json : root["submaps"]) {
-    const int id = submap_json.value("id", -1);
-    if (id < 0 || id >= static_cast<int>(labels_by_submap.size()) || !submaps[id] || submaps[id]->id != id) {
-      logger->warn("Label file contains invalid submap id {}", id);
-      return false;
-    }
-
-    const std::size_t expected_size = labels_by_submap[id].size();
-    if (submap_json.value("size", std::size_t{0}) != expected_size) {
-      logger->warn("Label size mismatch for submap {}", id);
-      return false;
-    }
-
-    if (!submap_json.contains("labels_rle") || !submap_json["labels_rle"].is_array()) {
-      logger->warn("Missing RLE labels for submap {}", id);
-      return false;
-    }
-
-    std::vector<std::int32_t> decoded;
-    decoded.reserve(expected_size);
-    for (const auto& run : submap_json["labels_rle"]) {
-      if (!run.is_array() || run.size() != 2) {
-        logger->warn("Invalid RLE entry for submap {}", id);
-        return false;
-      }
-
-      const std::int32_t label = run[0].get<std::int32_t>();
-      const std::size_t count = run[1].get<std::size_t>();
-      if (decoded.size() + count > expected_size) {
-        logger->warn("RLE overrun for submap {}", id);
-        return false;
-      }
-      decoded.insert(decoded.end(), count, label);
-    }
-
-    if (decoded.size() != expected_size) {
-      logger->warn("RLE size mismatch for submap {}", id);
-      return false;
-    }
-
-    loaded_labels[id] = std::move(decoded);
-    seen[id] = true;
-  }
-
-  for (const auto& submap : submaps) {
-    if (!submap || submap->id < 0 || submap->id >= static_cast<int>(seen.size()) || !seen[submap->id]) {
-      logger->warn("Label file is missing labels for a loaded submap");
-      return false;
-    }
-  }
-
-  class_infos = std::move(loaded_classes);
-  labels_by_submap = std::move(loaded_labels);
-  apply_display_mode();
-  is_dirty = false;
-  logger->info("Loaded semantic labels from {}", path);
-  return true;
 }
 
 PointClassInfo* PointLabelLayer::find_class(int class_id) {

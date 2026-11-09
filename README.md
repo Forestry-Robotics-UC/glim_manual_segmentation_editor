@@ -15,7 +15,9 @@ This package links against GLIM, reuses the same viewer stack, and stores semant
   - MinCut segmentation
   - RegionGrowing segmentation
   - Automatic ground selection based on [GroundGrid](https://github.com/dcmlr/groundgrid/tree/ros2-jazzy)
+  - Automatic ground selection based on Cloth Simulation Filtering (CSF)
 - Assign integer semantic class IDs to selected points.
+- Remove selected points from the editable map and exported point cloud.
 - Edit class names and RGBA colors.
 - Switch visualization between segmentation, intensity, Z height, and flat color.
 - Save and reload labels from the loaded source's default label file.
@@ -58,6 +60,8 @@ The input path argument is optional. If omitted, use `File > Open GLIM Map Direc
 
 Class `0` is reserved for `unlabeled`. Clearing selected labels resets those points to class `0`.
 
+To delete points, select them with any selection tool and click `Remove Selected Points` in `Semantic Labels`. This removes their geometry and labels, clears the selection, and updates the viewer in every visualization mode. `File > Save Labels` saves both labels and removals; reopen the original source and use `File > Load Labels` to restore them. `File > Export Semantic PLY` writes only the remaining points. The original GLIM map or input cloud file is unchanged. Loading an earlier label file also restores the point set recorded in that file.
+
 ## Visualization Modes
 
 The `Semantic Labels` panel has a `Visualization` selector:
@@ -68,6 +72,8 @@ The `Semantic Labels` panel has a `Visualization` selector:
 - `Flat color`: renders all map points with one editable color.
 
 Labels can still be edited in any visualization mode. Switching back to `Segmentation` reapplies the semantic colors.
+
+Use `Point size (m)` in the `Semantic Labels` panel to resize points immediately in any visualization mode. Drag the value or Ctrl+click to enter a size directly. The default is `0.050` m, with a range of `0.001` to `100.000` m. The same setting is also available under `File > Preferences` and stays in effect when loading another source during the session.
 
 ## Label Storage
 
@@ -89,8 +95,9 @@ The file contains:
 - class metadata: ID, name, RGBA color
 - submap IDs and point counts
 - run-length encoded class labels aligned to each submap's point order
+- removed point indices in the original source (format version 2, when points have been removed)
 
-Loading validates submap count and per-submap point counts before applying labels.
+Loading validates submap count and original per-submap point counts before applying labels and removals. Version 1 label files remain supported. In version 2, `size` is the original point count, `removed_indices` lists sorted original indices, and `labels_rle` describes the remaining points in their original order.
 
 ## PLY Export
 
@@ -132,5 +139,19 @@ If you use the ground segmentation tool please cite:
   pages={420-426},
   keywords={Sensors;Point cloud compression;Estimation;Laser radar;Image segmentation;Task analysis;Robot sensing systems;Range Sensing;Mapping;Field Robots},
   doi={10.1109/LRA.2023.3333233}
+}
+```
+
+For the CSF ground selection method please cite:
+```
+@article{zhang2016csf,
+  title={An Easy-to-Use Airborne LiDAR Data Filtering Method Based on Cloth Simulation},
+  author={Zhang, Wuming and Qi, Jianbo and Wan, Peng and Wang, Hongtao and Xie, Donghui and Wang, Xiaoyan and Yan, Guangjian},
+  journal={Remote Sensing},
+  volume={8},
+  number={6},
+  pages={501},
+  year={2016},
+  doi={10.3390/rs8060501}
 }
 ```

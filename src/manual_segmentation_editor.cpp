@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,7 +53,7 @@ const pcl::PCLPointField* find_field(const pcl::PCLPointCloud2& cloud, std::init
   for (const auto& field : cloud.fields) {
     const std::string field_name = to_lower(field.name);
     for (const auto* name : names) {
-      if (field_name == to_lower(name)) {
+      if (field_name == name) {
         return &field;
       }
     }
@@ -83,10 +84,30 @@ std::size_t field_scalar_size(const pcl::PCLPointField& field) {
   }
 }
 
+bool is_readable_scalar_field(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField* field) {
+  if (!field) {
+    return false;
+  }
+
+  const std::size_t scalar_size = field_scalar_size(*field);
+  return scalar_size != 0 && (field->count == 0 || field->count >= 1) && field->offset + scalar_size <= cloud.point_step;
+}
+
+std::size_t point_data_offset(const pcl::PCLPointCloud2& cloud, std::size_t point_index) {
+  if (cloud.width == 0) {
+    return point_index * cloud.point_step;
+  }
+
+  const std::size_t row = point_index / cloud.width;
+  const std::size_t column = point_index % cloud.width;
+  const std::size_t row_step = cloud.row_step ? cloud.row_step : static_cast<std::size_t>(cloud.width) * cloud.point_step;
+  return row * row_step + column * cloud.point_step;
+}
+
 template <typename T>
 T read_value(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField& field, std::size_t point_index) {
   T value{};
-  const std::size_t offset = point_index * cloud.point_step + field.offset;
+  const std::size_t offset = point_data_offset(cloud, point_index) + field.offset;
   if (offset + sizeof(T) > cloud.data.size()) {
     throw std::out_of_range("point field offset outside cloud data");
   }
@@ -128,13 +149,8 @@ gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud
   const auto* x_field = find_field(cloud, {"x"});
   const auto* y_field = find_field(cloud, {"y"});
   const auto* z_field = find_field(cloud, {"z"});
-  if (!x_field || !y_field || !z_field) {
-    logger->warn("Point cloud file is missing x/y/z fields");
-    return nullptr;
-  }
-
-  if (field_scalar_size(*x_field) == 0 || field_scalar_size(*y_field) == 0 || field_scalar_size(*z_field) == 0) {
-    logger->warn("Point cloud file uses unsupported x/y/z field types");
+  if (!is_readable_scalar_field(cloud, x_field) || !is_readable_scalar_field(cloud, y_field) || !is_readable_scalar_field(cloud, z_field)) {
+    logger->warn("Point cloud file is missing readable scalar x/y/z fields");
     return nullptr;
   }
 
@@ -142,10 +158,9 @@ gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud
   const auto* normal_x_field = find_field(cloud, {"normal_x", "nx"});
   const auto* normal_y_field = find_field(cloud, {"normal_y", "ny"});
   const auto* normal_z_field = find_field(cloud, {"normal_z", "nz"});
-  const bool has_intensity_field = intensity_field && field_scalar_size(*intensity_field) != 0;
+  const bool has_intensity_field = is_readable_scalar_field(cloud, intensity_field);
   const bool has_normal_fields =
-    normal_x_field && normal_y_field && normal_z_field && field_scalar_size(*normal_x_field) != 0 && field_scalar_size(*normal_y_field) != 0 &&
-    field_scalar_size(*normal_z_field) != 0;
+    is_readable_scalar_field(cloud, normal_x_field) && is_readable_scalar_field(cloud, normal_y_field) && is_readable_scalar_field(cloud, normal_z_field);
 
   std::size_t point_count = static_cast<std::size_t>(cloud.width) * cloud.height;
   if (point_count == 0) {
@@ -155,6 +170,11 @@ gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud
     }
     point_count = cloud.data.size() / cloud.point_step;
   }
+  if (point_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    logger->warn("Point cloud contains too many points for the editor: {}", point_count);
+    return nullptr;
+  }
+
   std::vector<Eigen::Vector4d> points;
   std::vector<Eigen::Vector4d> normals;
   std::vector<double> intensities;
@@ -186,12 +206,18 @@ gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud
       }
 
       if (has_normal_fields) {
-        const double nx = read_scalar(cloud, *normal_x_field, i);
-        const double ny = read_scalar(cloud, *normal_y_field, i);
-        const double nz = read_scalar(cloud, *normal_z_field, i);
-        const bool normal_valid = std::isfinite(nx) && std::isfinite(ny) && std::isfinite(nz) && Eigen::Vector3d(nx, ny, nz).squaredNorm() > 1.0e-12;
+        Eigen::Vector3d normal(
+          read_scalar(cloud, *normal_x_field, i),
+          read_scalar(cloud, *normal_y_field, i),
+          read_scalar(cloud, *normal_z_field, i));
+        const bool normal_valid = normal.allFinite() && normal.squaredNorm() > 1.0e-12;
         normals_are_valid &= normal_valid;
-        normals.emplace_back(normal_valid ? Eigen::Vector4d(nx, ny, nz, 0.0) : Eigen::Vector4d::Zero());
+        if (normal_valid) {
+          normal.normalize();
+          normals.emplace_back(normal.x(), normal.y(), normal.z(), 0.0);
+        } else {
+          normals.emplace_back(Eigen::Vector4d::Zero());
+        }
       }
     }
   } catch (const std::exception& e) {
@@ -211,6 +237,8 @@ gtsam_points::PointCloudCPU::Ptr pcl_to_point_cloud_cpu(const pcl::PCLPointCloud
   }
   if (normals_are_valid) {
     frame->add_normals(normals);
+  } else if (has_normal_fields) {
+    logger->warn("Imported normals contain invalid values; normals will be estimated instead");
   }
 
   if (skipped) {
@@ -306,7 +334,7 @@ void ManualSegmentationEditor::main_menu() {
 
   if (start_close_map) {
     if (submaps.empty()) {
-      logger->warn("No map to close");
+      logger->warn("No source to close");
     } else if (close_current_source()) {
       logger->info("Closed current source");
     }
@@ -528,6 +556,11 @@ void ManualSegmentationEditor::sync_class_inputs(int class_id) {
 std::string ManualSegmentationEditor::default_label_path() const {
   if (map_path.empty()) {
     return "semantic_labels.json";
+  }
+
+  std::error_code ec;
+  if (std::filesystem::is_directory(map_path, ec)) {
+    return map_path + "/semantic_labels.json";
   }
 
   if (is_point_cloud_file(map_path)) {

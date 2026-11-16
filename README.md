@@ -48,11 +48,13 @@ ros2 run glim_manual_segmentation_editor manual_segmentation_editor /path/to/clo
 
 The input path argument is optional. If omitted, use `File > Open GLIM Map Directory` or `File > Open Point Cloud File` in the viewer.
 
+Standalone clouds must contain scalar `x`, `y`, and `z` fields. Common intensity field names are retained, and existing `normal_x`/`normal_y`/`normal_z` or `nx`/`ny`/`nz` fields are used when valid. Otherwise, normals are estimated after loading. Non-finite points are skipped while keeping imported attributes aligned.
+
 ## Basic Workflow
 
-1. Run GLIM on a ROS2 dataset or in real-time.
-2. Load a GLIM map directory.
-4. Select points using the editor selection tools.
+1. Start the editor.
+2. Load a GLIM map directory or a standalone PLY/PCD file.
+3. Select points using the editor selection tools.
 4. In `Semantic Labels`, choose a class ID, name, and color.
 5. Click `Assign Selected`.
 6. Use `File > Save Labels` to write the default semantic label file.
